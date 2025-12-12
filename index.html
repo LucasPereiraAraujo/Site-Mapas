@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gerenciador de Pontos de Venda e Raio de Busca</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <style>
+        /* Estilos básicos para o site */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        #map {
+            flex-grow: 1;
+            z-index: 1;
+        }
+        #controls {
+            padding: 10px;
+            background: #f8f8f8;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            z-index: 2;
+            flex-wrap: wrap;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+        }
+        button {
+            padding: 5px 10px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #selected-center {
+            font-weight: bold;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <div class="control-group">
+            <label for="radius">Raio (km):</label>
+            <input type="number" id="radius" value="100" min="1" step="1">
+        </div>
+        <div class="control-group">
+            <label>Centro Selecionado:</label>
+            <span id="selected-center">Nenhum</span>
+        </div>
+        <div class="control-group">
+            <button id="add-point">Adicionar Ponto</button>
+        </div>
+        <div class="control-group">
+            <button id="export-points">Exportar Pontos</button>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+    <script>
+        // 1. DADOS DE ENTRADA (SEUS PONTOS WKT)
+        // Seus 14 pontos fornecidos no formato WKT
+        const wktPointsData = `
+        POINT (-41.5089708 -17.8608479),07 - Bela Vista,
+        POINT (-42.5592797 -19.46319),11 - Ipatinga,
+        POINT (-39.0653656 -16.4443537),33 - Passarela,
+        POINT (-41.5025529 -16.5585736),58 - Itaobim,
+        POINT (-39.8558749 -18.7166078),85 - São Matheus,
+        POINT (-42.6438176 -21.5304301),109 - Leopoldina,
+        POINT (-43.1735433 -19.808204),110 - João Monlevade,
+        POINT (-42.1417003 -19.7886652),152 - Caratinga,
+        POINT (-40.0653505 -19.3990502),167 - Linhares,
+        POINT (-43.7866376 -20.6610086),195 - São Sebastião,
+        POINT (-40.8400759 -14.8577988),200 - Vitor Brito,
+        POINT (-41.4376773 -19.8164299),206 - Mutum,
+        POINT (-42.6946223 -21.8783264),219 - Além Paraíba,
+        POINT (-40.3081077 -20.1279854),243 - Norte Sul
+        `;
+
+        let customPoints = []; // Para pontos adicionados manualmente
+        let initialViewCalculated = false; // Flag para garantir que o mapa se ajuste apenas uma vez
+
+        // 2. INICIALIZAÇÃO DO MAPA
+        // Define o mapa para iniciar no primeiro ponto da lista, se disponível
+        const initialCoords = [-18.71, -41.50]; // Um ponto central aproximado
+        const map = L.map('map').setView(initialCoords, 7);
+        let currentCircle = null;
+
+        // Adiciona as camadas base (tiles) do OpenStreetMap
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // 3. FUNÇÕES DE MAPA
+
+        /**
+         * Desenha um círculo no mapa com base no centro e raio atuais.
+         * @param {Array} center - Array [latitude, longitude].
+         * @param {number} radiusKm - Raio em quilômetros.
+         * @param {string} label - Rótulo a ser exibido no controle.
+         */
+        function drawCircle(center, radiusKm, label) {
+            // Remove o círculo existente, se houver
+            if (currentCircle) {
+                map.removeLayer(currentCircle);
+            }
+
+            const radiusMeters = radiusKm * 1000; // Leaflet usa metros
+
+            currentCircle = L.circle(center, {
+                color: 'red',
+                fillColor: '#f03',
+                fillOpacity: 0.2,
+                radius: radiusMeters
+            }).addTo(map);
+
+            // Atualiza o painel de controle
+            document.getElementById('selected-center').innerHTML =
+                `${label} <br> Lat: ${center[0].toFixed(6)}, Lng: ${center[1].toFixed(6)}`;
+        }
+
+        // 4. PROCESSAMENTO DOS PONTOS WKT
+
+        /**
+         * Processa os pontos WKT e adiciona os marcadores no mapa.
+         */
+        function processWKTPoints(wktData) {
+            const bounds = []; // Para ajustar a visualização inicial do mapa
+            
+            // Remove espaços extras e divide o texto em linhas
+            const lines = wktData.trim().split('\n').filter(line => line.trim() !== '');
+
+            lines.forEach(line => {
+                // Regex para capturar Lat/Lng e o rótulo
+                const match = line.match(/POINT \((?<lng>-?\d+\.\d+) (?<lat>-?\d+\.\d+)\),(?<label>.*)/i);
+
+                if (match && match.groups) {
+                    // Os pontos WKT fornecidos estão no formato Longitude, Latitude (Lng Lat)
+                    const lat = parseFloat(match.groups.lat);
+                    const lng = parseFloat(match.groups.lng);
+                    // Limpa e normaliza o rótulo
+                    let label = match.groups.label.trim().replace(/['",]/g, '').trim();
+
+                    // Leaflet usa [latitude, longitude]
+                    const center = [lat, lng];
+                    bounds.push(center);
+
+                    // Cria o marcador para o ponto
+                    const marker = L.marker(center).addTo(map);
+
+                    // Adiciona um popup para identificação
+                    marker.bindPopup(`
+                        <b>${label}</b><br>
+                        Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}<br>
+                        (Clique no ícone para definir o centro)
+                    `);
+
+                    // Ação ao clicar no marcador: define o centro e desenha o círculo
+                    marker.on('click', function (e) {
+                        const radius = parseFloat(document.getElementById('radius').value);
+                        drawCircle(center, radius, label);
+                    });
+                    
+                    // Adiciona o ponto à lista de pontos personalizados (para exportação, se o usuário quiser)
+                    customPoints.push({
+                        lat: lat,
+                        lng: lng,
+                        label: label
+                    });
+                }
+            });
+            
+            // Ajusta o mapa para mostrar todos os pontos iniciais
+            if (bounds.length > 0 && !initialViewCalculated) {
+                 map.fitBounds(bounds, { padding: [50, 50] }); // Adiciona um padding
+                 initialViewCalculated = true;
+            }
+        }
+
+        // Processa os dados iniciais
+        processWKTPoints(wktPointsData);
+
+
+        // 5. GERENCIAMENTO DE PONTOS PERSONALIZADOS (Adicionar/Remover)
+
+        const drawnItems = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+
+        // Configuração para o botão "Adicionar Ponto" (Desenho)
+        const drawControl = new L.Control.Draw({
+            edit: {
+                featureGroup: drawnItems,
+            },
+            draw: {
+                polygon: false,
+                polyline: false,
+                rectangle: false,
+                circle: false,
+                circlemarker: false,
+                marker: true // Habilita o marcador para adição manual
+            }
+        });
+
+        // Evento para quando um ponto (marcador) for criado manualmente
+        map.on(L.Draw.Event.CREATED, function (event) {
+            const layer = event.layer;
+            drawnItems.addLayer(layer);
+
+            // Adiciona o novo ponto à lista interna
+            const latlng = layer.getLatLng();
+            const newLabel = `Ponto Manual ${customPoints.length + 1}`;
+            
+            customPoints.push({
+                lat: latlng.lat,
+                lng: latlng.lng,
+                label: newLabel,
+                isManual: true // Marca como manual
+            });
+
+            // Adiciona um popup para facilitar a identificação e remoção
+            layer.bindPopup(`${newLabel} (lat: ${latlng.lat.toFixed(6)}, lng: ${latlng.lng.toFixed(6)})`).openPopup();
+        });
+
+        // Evento para quando um item é deletado
+        map.on(L.Draw.Event.DELETED, function (event) {
+            // Remove o ponto da lista interna (simplificado: recarrega a lista apenas com pontos que ainda estão no mapa)
+            customPoints = [];
+             // Adiciona de volta os pontos iniciais (não-manuais)
+            processWKTPoints(wktPointsData); 
+            
+            // Adiciona de volta os pontos manuais que sobraram
+            drawnItems.eachLayer(function(layer) {
+                const latlng = layer.getLatLng();
+                 // Verifica se é um marcador
+                if (layer.getLatLng) { 
+                    customPoints.push({
+                        lat: latlng.lat,
+                        lng: latlng.lng,
+                        label: `Ponto Manual Re-Indexado` 
+                    });
+                }
+            });
+        });
+
+        // 6. EVENT LISTENERS DO PAINEL DE CONTROLE
+
+        // Botão para iniciar o modo de adição de ponto
+        document.getElementById('add-point').addEventListener('click', () => {
+             // Ativa a ferramenta de marcador (POINT)
+             new L.Draw.Marker(map, drawControl.options.draw.marker).enable();
+        });
+
+        // Botão para exportar todos os pontos (iniciais + manuais)
+        document.getElementById('export-points').addEventListener('click', () => {
+            if (customPoints.length === 0) {
+                alert("Nenhum ponto para exportar.");
+                return;
+            }
+
+            let exportText = "latitude,longitude,label\n";
+            customPoints.forEach(p => {
+                // Garante que os rótulos não contenham vírgulas na exportação CSV (ou as envolve em aspas)
+                const safeLabel = p.label.replace(/"/g, '""'); 
+                exportText += `${p.lat.toFixed(6)},${p.lng.toFixed(6)},"${safeLabel}"\n`;
+            });
+
+            // Cria e inicia o download do arquivo CSV
+            const blob = new Blob([exportText], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'pontos_exportados_mapa.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            alert("Pontos exportados com sucesso! Verifique seu arquivo 'pontos_exportados_mapa.csv'.");
+        });
+
+        // Listener para o campo de raio
+        document.getElementById('radius').addEventListener('input', (e) => {
+            const newRadius = parseFloat(e.target.value);
+            if (currentCircle && !isNaN(newRadius) && newRadius > 0) {
+                currentCircle.setRadius(newRadius * 1000); // Atualiza o círculo existente (para metros)
+            }
+        });
+
+        // 7. Configura o Leaflet.Draw para permitir a edição/deleção
+        map.addControl(drawControl);
+    </script>
+
+</body>
+</html>
